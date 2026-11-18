@@ -40,3 +40,7 @@ export const MODEL_OPTIONS: ModelOption[] = [
 export function getModelOption(id: ModelOptionId): ModelOption {
   return MODEL_OPTIONS.find((m) => m.id === id) ?? MODEL_OPTIONS[0];
 }
+export function resolveModelCandidates(selectedModel: string): string[] {
+  const clean = (selectedModel || 'gemini-2.5-flash').replace(/^models\//, '');
+  return Array.from(new Set([clean, 'gemini-2.5-flash', 'gemini-2.0-flash']));
+}
