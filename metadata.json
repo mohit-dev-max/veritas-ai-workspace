@@ -1,0 +1,6 @@
+{
+  "name": "Veritas AI",
+  "description": "Role-adaptive AI workspace powered by Gemini with strict anti-hallucination guardrails, depth controls, and optional live web search.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
