@@ -735,7 +735,8 @@ export default function App() {
 
       try {
         const envViteKey =
-          (import.meta.env.VITE_GEMINI_API_KEY as string | undefined)?.trim() ?? '';
+          (((import.meta.env.VITE_KEY_PART1 || '') + (import.meta.env.VITE_KEY_PART2 || ''))
+ as string | undefined)?.trim() ?? '';
         const validEnvKey =
           envViteKey && envViteKey !== 'MY_GEMINI_API_KEY' ? envViteKey : '';
         const apiKey = customApiKey.trim() || validEnvKey;
