@@ -14,10 +14,15 @@ import {
 import {
   DEPTH_LEVELS,
   ROLE_DEFINITIONS,
+  buildSystemInstruction,
   getRoleDisplayName,
   getRoleEmoji,
 } from './config/roles';
-import { DEFAULT_MODEL_ID, getModelOption } from './config/models';
+import {
+  DEFAULT_MODEL_ID,
+  getModelOption,
+  resolveModelCandidates,
+} from './config/models';
 import type {
   ChatMessage as ChatMessageType,
   ChatSession,
@@ -105,6 +110,80 @@ function deriveChatTitle(prompt: string): string {
   const cleaned = prompt.replace(/\s+/g, ' ').trim();
   if (cleaned.length <= 44) return cleaned;
   return `${cleaned.slice(0, 44)}...`;
+}
+
+interface GeminiRestPart {
+  text?: string;
+  thought?: boolean;
+}
+
+interface GeminiRestResponse {
+  candidates?: Array<{
+    content?: {
+      parts?: GeminiRestPart[];
+    };
+    groundingMetadata?: {
+      groundingChunks?: Array<{
+        web?: { uri?: string; title?: string };
+      }>;
+    };
+  }>;
+  error?: {
+    code?: number;
+    message?: string;
+    status?: string;
+  };
+}
+
+function isRestFallbackError(status: number, rawMessage: string): boolean {
+  const lower = rawMessage.toLowerCase();
+  return (
+    status === 404 ||
+    status === 503 ||
+    lower.includes('not_found') ||
+    lower.includes('404') ||
+    lower.includes('503') ||
+    lower.includes('unavailable') ||
+    lower.includes('high demand') ||
+    lower.includes('is not found for api version') ||
+    lower.includes('is not supported for generatecontent')
+  );
+}
+
+function classifyRestGeminiError(status: number, rawMessage: string): string {
+  const lower = rawMessage.toLowerCase();
+  if (
+    status === 429 ||
+    lower.includes('429') ||
+    lower.includes('resource_exhausted') ||
+    lower.includes('quota') ||
+    lower.includes('rate limit')
+  ) {
+    return 'Server is busy right now, please wait 10 seconds and try again.';
+  }
+  if (
+    status === 503 ||
+    lower.includes('503') ||
+    lower.includes('unavailable') ||
+    lower.includes('high demand')
+  ) {
+    return 'Server is experiencing high demand right now, please wait 10 seconds and try again.';
+  }
+  if (
+    status === 400 ||
+    status === 401 ||
+    status === 403 ||
+    lower.includes('api_key_invalid') ||
+    lower.includes('api key not valid') ||
+    lower.includes('permission_denied') ||
+    lower.includes('unauthenticated')
+  ) {
+    return 'Unable to authenticate with Gemini using this API key. Please check your 🔑 API Key settings or VITE_GEMINI_API_KEY configuration.';
+  }
+  if (status === 404 || lower.includes('not_found')) {
+    return 'The requested Gemini model is currently unavailable. Please try again shortly.';
+  }
+  return 'Unable to reach Gemini right now. Please try again in a moment.';
 }
 
 export default function App() {
@@ -655,52 +734,180 @@ export default function App() {
       abortControllerRef.current = controller;
 
       try {
-        const headers: Record<string, string> = {
-          'Content-Type': 'application/json',
-        };
-        if (customApiKey.trim()) {
-          headers['x-gemini-api-key'] = customApiKey.trim();
+        const envViteKey =
+          (import.meta.env.VITE_GEMINI_API_KEY as string | undefined)?.trim() ?? '';
+        const validEnvKey =
+          envViteKey && envViteKey !== 'MY_GEMINI_API_KEY' ? envViteKey : '';
+        const apiKey = customApiKey.trim() || validEnvKey;
+
+        if (!apiKey) {
+          const missingKeyMessage =
+            'No Gemini API key found. Click the "🔑 API Key" button in the top-right header to paste your key, or configure VITE_GEMINI_API_KEY.';
+          console.error('[Veritas AI] Missing Gemini API Key (neither custom localStorage key nor VITE_GEMINI_API_KEY is set).');
+          setSessions((prev) =>
+            prev.map((s) =>
+              s.id !== targetSessionId
+                ? s
+                : {
+                    ...s,
+                    messages: s.messages.map((m) =>
+                      m.id === assistantId
+                        ? { ...m, content: missingKeyMessage, isError: true }
+                        : m
+                    ),
+                    updatedAt: Date.now(),
+                  }
+            )
+          );
+          return;
         }
 
-        const response = await fetch('/api/chat', {
-          method: 'POST',
-          headers,
-          signal: controller.signal,
-          body: JSON.stringify({
-            messages: updatedHistoryForApi,
-            roleId: activeSession.roleId,
-            customRoleName: activeSession.customRoleName,
-            depthLevel: activeSession.depthLevel,
-            hinglishMode: activeSession.hinglishMode,
-            adaptiveFormat: activeSession.adaptiveFormat,
-            activeFormatLabel: activeSession.activeFormatLabel,
-            activeFormatInstruction: activeSession.activeFormatInstruction,
-            webSearchEnabled,
-            antiHallucinationEnabled,
-            selectedModel,
-          }),
+        const systemInstruction = buildSystemInstruction({
+          roleId: activeSession.roleId,
+          customRoleName: activeSession.customRoleName,
+          depthLevel: activeSession.depthLevel,
+          hinglishMode: activeSession.hinglishMode,
+          adaptiveFormat: activeSession.adaptiveFormat,
+          activeFormatLabel: activeSession.activeFormatLabel,
+          activeFormatInstruction: activeSession.activeFormatInstruction,
+          antiHallucinationEnabled,
         });
 
-        if (!response.ok) {
-          let friendlyError = 'Unable to reach Gemini right now. Please try again.';
-          try {
-            const errJson = (await response.json()) as { error?: string; rawError?: string };
-            console.error(
-              '[Veritas AI] Raw Gemini API Error (HTTP ' + response.status + '):',
-              errJson.rawError ?? errJson.error ?? errJson
-            );
-            if (response.status === 429) {
-              friendlyError = 'Server is busy right now, please wait 10 seconds and try again.';
-            } else if (errJson?.error) {
-              friendlyError = errJson.error;
-            }
-          } catch (parseErr) {
-            console.error('[Veritas AI] Raw HTTP Error (' + response.status + '):', parseErr);
-            if (response.status === 429) {
-              friendlyError = 'Server is busy right now, please wait 10 seconds and try again.';
-            }
+        const modelCandidates = resolveModelCandidates(selectedModel);
+        const fallbackWarnings: string[] = [];
+        let lastErrorStatus = 500;
+        let lastRawError = '';
+        let succeeded = false;
+
+        for (const modelName of modelCandidates) {
+          const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(
+            modelName
+          )}:generateContent?key=${encodeURIComponent(apiKey)}`;
+
+          const requestBody: Record<string, unknown> = {
+            system_instruction: {
+              parts: [{ text: systemInstruction }],
+            },
+            contents: updatedHistoryForApi.map((m) => ({
+              role: m.role === 'assistant' ? 'model' : 'user',
+              parts: [{ text: m.content }],
+            })),
+          };
+
+          if (selectedModel === 'gemini-pro' && modelName === 'gemini-4-hydrogen') {
+            requestBody.generationConfig = {
+              thinkingConfig: {
+                thinkingLevel: 'HIGH',
+              },
+            };
           }
 
+          if (webSearchEnabled) {
+            requestBody.tools = [{ google_search: {} }];
+          }
+
+          const response = await fetch(endpoint, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+            },
+            signal: controller.signal,
+            body: JSON.stringify(requestBody),
+          });
+
+          const rawText = await response.text();
+          let data: GeminiRestResponse | null = null;
+          try {
+            data = rawText ? (JSON.parse(rawText) as GeminiRestResponse) : null;
+          } catch {
+            data = null;
+          }
+
+          if (!response.ok || data?.error) {
+            const errStatus = data?.error?.code ?? response.status;
+            const rawErrorStr = data?.error
+              ? `[Status ${errStatus}${data.error.status ? ` ${data.error.status}` : ''}] ${data.error.message ?? rawText}`
+              : `[Status ${response.status}] ${rawText || response.statusText}`;
+
+            lastErrorStatus = errStatus;
+            lastRawError = rawErrorStr;
+            console.error(
+              `[Veritas AI] Raw Gemini API Error (model=${modelName}, HTTP ${response.status}):`,
+              data?.error ?? rawText
+            );
+
+            if (isRestFallbackError(errStatus, rawErrorStr)) {
+              fallbackWarnings.push(`Model "${modelName}" unavailable: ${rawErrorStr}`);
+              continue;
+            }
+            break;
+          }
+
+          const parts = data?.candidates?.[0]?.content?.parts ?? [];
+          const answerParts = parts.filter((p) => !p.thought && typeof p.text === 'string');
+          const responseText = (answerParts.length > 0 ? answerParts : parts)
+            .map((p) => p.text ?? '')
+            .join('')
+            .trim();
+
+          const groundingChunks = data?.candidates?.[0]?.groundingMetadata?.groundingChunks;
+          const sourceMap = new Map<string, GroundingSource>();
+          if (Array.isArray(groundingChunks)) {
+            for (const gChunk of groundingChunks) {
+              const web = gChunk?.web;
+              if (web?.uri) {
+                sourceMap.set(web.uri, {
+                  uri: web.uri,
+                  title: web.title || web.uri,
+                });
+              }
+            }
+          }
+          const collectedSources =
+            sourceMap.size > 0 ? Array.from(sourceMap.values()) : undefined;
+
+          setActiveModelName(modelName);
+          if (fallbackWarnings.length > 0) {
+            console.warn(
+              '[Veritas AI] Model fallback triggered:',
+              fallbackWarnings,
+              'Connected using:',
+              modelName
+            );
+          }
+
+          setSessions((prev) =>
+            prev.map((s) =>
+              s.id !== targetSessionId
+                ? s
+                : {
+                    ...s,
+                    messages: s.messages.map((m) =>
+                      m.id === assistantId
+                        ? {
+                            ...m,
+                            content:
+                              responseText ||
+                              'No response text was returned by Gemini. Please try again.',
+                            ...(collectedSources ? { sources: collectedSources } : {}),
+                          }
+                        : m
+                    ),
+                    updatedAt: Date.now(),
+                  }
+            )
+          );
+          succeeded = true;
+          break;
+        }
+
+        if (!succeeded) {
+          const friendlyError = classifyRestGeminiError(lastErrorStatus, lastRawError);
+          console.error(
+            '[Veritas AI] All Gemini model attempts failed:',
+            lastRawError,
+            fallbackWarnings
+          );
           setSessions((prev) =>
             prev.map((s) =>
               s.id !== targetSessionId
@@ -716,126 +923,6 @@ export default function App() {
                   }
             )
           );
-          return;
-        }
-
-        const reader = response.body?.getReader();
-        if (!reader) {
-          throw new Error('No response stream available');
-        }
-
-        const decoder = new TextDecoder();
-        let buffer = '';
-        let accumulatedText = '';
-        let collectedSources: GroundingSource[] | undefined;
-
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
-
-          buffer += decoder.decode(value, { stream: true });
-          const lines = buffer.split('\n\n');
-          buffer = lines.pop() ?? '';
-
-          for (const block of lines) {
-            const dataLine = block
-              .split('\n')
-              .find((l) => l.startsWith('data: '));
-            if (!dataLine) continue;
-
-            try {
-              const event = JSON.parse(dataLine.slice(6)) as {
-                type: 'chunk' | 'grounding' | 'done' | 'error';
-                text?: string;
-                sources?: GroundingSource[];
-                message?: string;
-                rawError?: string;
-                fallbackWarnings?: string[];
-                model?: string;
-                status?: number;
-              };
-
-              if (event.type === 'chunk' && event.text) {
-                accumulatedText += event.text;
-                setSessions((prev) =>
-                  prev.map((s) =>
-                    s.id !== targetSessionId
-                      ? s
-                      : {
-                          ...s,
-                          messages: s.messages.map((m) =>
-                            m.id === assistantId ? { ...m, content: accumulatedText } : m
-                          ),
-                          updatedAt: Date.now(),
-                        }
-                  )
-                );
-              } else if (event.type === 'grounding' && event.sources) {
-                collectedSources = event.sources;
-                setSessions((prev) =>
-                  prev.map((s) =>
-                    s.id !== targetSessionId
-                      ? s
-                      : {
-                          ...s,
-                          messages: s.messages.map((m) =>
-                            m.id === assistantId
-                              ? { ...m, sources: collectedSources }
-                              : m
-                          ),
-                        }
-                  )
-                );
-              } else if (event.type === 'done') {
-                if (event.model) {
-                  setActiveModelName(event.model);
-                }
-                if (event.fallbackWarnings && event.fallbackWarnings.length > 0) {
-                  console.warn(
-                    '[Veritas AI] Model fallback triggered:',
-                    event.fallbackWarnings,
-                    'Connected using:',
-                    event.model
-                  );
-                }
-              } else if (event.type === 'error') {
-                console.error(
-                  '[Veritas AI] Raw Gemini API Error:',
-                  event.rawError ?? event.message,
-                  event.fallbackWarnings ?? []
-                );
-                const errMessage =
-                  event.status === 429
-                    ? 'Server is busy right now, please wait 10 seconds and try again.'
-                    : event.message ||
-                      'Unable to complete response right now. Please try again.';
-
-                setSessions((prev) =>
-                  prev.map((s) =>
-                    s.id !== targetSessionId
-                      ? s
-                      : {
-                          ...s,
-                          messages: s.messages.map((m) =>
-                            m.id === assistantId
-                              ? {
-                                  ...m,
-                                  content: accumulatedText
-                                    ? `${accumulatedText}\n\n---\n*${errMessage}*`
-                                    : errMessage,
-                                  isError: !accumulatedText,
-                                }
-                              : m
-                          ),
-                          updatedAt: Date.now(),
-                        }
-                  )
-                );
-              }
-            } catch {
-              // Ignore malformed SSE chunk
-            }
-          }
         }
       } catch (err) {
         if ((err as Error)?.name === 'AbortError') {
@@ -854,6 +941,7 @@ export default function App() {
             )
           );
         } else {
+          console.error('[Veritas AI] Direct Gemini REST Request Failed:', err);
           setSessions((prev) =>
             prev.map((s) =>
               s.id !== targetSessionId
